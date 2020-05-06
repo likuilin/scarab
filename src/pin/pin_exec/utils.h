@@ -66,6 +66,42 @@
     }                                                                       \
   } while(0)
 
+struct Mem_Writes_Info {
+  enum class Type {
+    NO_WRITE,
+    ONE_WRITE,
+    MULTI_WRITE,
+  };
+
+  Mem_Writes_Info() : type(Type::NO_WRITE) {}
+
+  Mem_Writes_Info(ADDRINT addr, uint32_t size) :
+      type(Type::ONE_WRITE), single_write_addr(addr), single_write_size(size) {}
+
+  Mem_Writes_Info(
+    const PIN_MULTI_MEM_ACCESS_INFO* const multi_mem_access_info) :
+      type(Type::MULTI_WRITE),
+      multi_mem_access_info(multi_mem_access_info) {}
+
+  uint32_t get_num_mem_writes() {
+    switch(type) {
+      case Type::NO_WRITE:
+        return 0;
+      case Type::ONE_WRITE:
+        return 1;
+      case Type::MULTI_WRITE:
+        return multi_mem_access_info->numberOfMemops;
+    }
+    ASSERTM(0, false, "Bad Mem Write Info");
+    return 0;
+  }
+
+  const Type                             type;
+  const ADDRINT                          single_write_addr     = 0;
+  const uint32_t                         single_write_size     = 0;
+  const PIN_MULTI_MEM_ACCESS_INFO* const multi_mem_access_info = nullptr;
+};
+
 struct MemState {
   ADDRINT mem_addr;
   UINT32  mem_size;
@@ -111,13 +147,18 @@ struct ProcState {
 
   ProcState() : mem_state_list(NULL), num_mem_state(0) {}
 
-  void init(UINT64 _uid, bool _u_i, bool _wrongpath, bool _wrongpath_nop_mode,
-            ADDRINT _wpnm_eip, UINT _num_mem_state) {
+  void update(CONTEXT* _ctxt, UINT64 _uid, bool _u_i, bool _wrongpath,
+              bool _wrongpath_nop_mode, ADDRINT _wpnm_eip,
+              Mem_Writes_Info _mem_write_info) {
     uid                      = _uid;
     unretireable_instruction = _u_i;
     wrongpath                = _wrongpath;
     wrongpath_nop_mode       = _wrongpath_nop_mode;
     wpnm_eip                 = _wpnm_eip;
+
+    PIN_SaveContext(_ctxt, &ctxt);
+
+    uint32_t _num_mem_state = _mem_write_info.get_num_mem_writes();
 
     if(_num_mem_state > num_mem_state) {
       if(NULL != mem_state_list) {
@@ -128,6 +169,32 @@ struct ProcState {
     }
 
     num_mem_state = _num_mem_state;
+
+    auto save_mem = [](MemState* mem_state, ADDRINT write_addr,
+                       uint32_t write_size) {
+      ADDRINT masked_write_addr = ADDR_MASK(write_addr);
+      mem_state->init(masked_write_addr, write_size);
+      PIN_SafeCopy(mem_state->mem_data_ptr, (void*)masked_write_addr,
+                   write_size);
+    };
+
+    switch(_mem_write_info.type) {
+      case Mem_Writes_Info::Type::NO_WRITE:
+        break;
+      case Mem_Writes_Info::Type::ONE_WRITE:
+        save_mem(&mem_state_list[0], _mem_write_info.single_write_addr,
+                 _mem_write_info.single_write_size);
+        break;
+      case Mem_Writes_Info::Type::MULTI_WRITE:
+        for(uint32_t i = 0;
+            i < _mem_write_info.multi_mem_access_info->numberOfMemops; ++i) {
+          save_mem(
+            &mem_state_list[i],
+            _mem_write_info.multi_mem_access_info->memop[i].memoryAddress,
+            _mem_write_info.multi_mem_access_info->memop[i].bytesAccessed);
+        }
+        break;
+    }
   }
 
   ~ProcState() {
@@ -257,6 +324,44 @@ class Address_Tracker {
   // Using std::unordered_map instead of std::unordered_set because PinCRT is
   // incomplete.
   std::unordered_map<ADDRINT, bool> tracked_addresses;
+};
+
+class Pintool_State {
+ public:
+  Pintool_State() { clear_changing_control_flow(); }
+
+  // ******  Methods for checking the pintool state  ********
+  bool skip_further_processing() { return should_change_control_flow(); }
+
+  bool should_change_control_flow() { return should_change_control_flow_; }
+
+  uint64_t get_next_inst_uid() { return uid_ctr++; }
+
+  uint64_t get_curr_inst_uid() { return uid_ctr; }
+
+  // ***********************  Setters  **********************
+  void clear_changing_control_flow() { should_change_control_flow_ = false; }
+
+  void set_next_state_for_changing_control_flow(CONTEXT* next_state,
+                                                bool     redirect_rip,
+                                                uint64_t next_rip) {
+    should_change_control_flow_ = true;
+    PIN_SaveContext(next_state, &next_pintool_state_);
+    if(redirect_rip) {
+      PIN_SetContextReg(&next_pintool_state_, REG_INST_PTR, next_rip);
+    }
+  }
+
+  // **********************  Accessors  *********************
+  CONTEXT* get_context_for_changing_control_flow() {
+    return &next_pintool_state_;
+  }
+
+ private:
+  bool    should_change_control_flow_;
+  CONTEXT next_pintool_state_;
+
+  uint64_t uid_ctr = 0;
 };
 
 
