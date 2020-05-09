@@ -66,13 +66,8 @@
     }                                                                       \
   } while(0)
 
-struct Mem_Writes_Info {
-  enum class Type {
-    NO_WRITE,
-    ONE_WRITE,
-    MULTI_WRITE,
-  };
-
+class Mem_Writes_Info {
+ public:
   Mem_Writes_Info() : type(Type::NO_WRITE) {}
 
   Mem_Writes_Info(ADDRINT addr, uint32_t size) :
@@ -95,6 +90,31 @@ struct Mem_Writes_Info {
     ASSERTM(0, false, "Bad Mem Write Info");
     return 0;
   }
+
+  template <typename F>
+  void for_each_mem(F&& func) {
+    switch(type) {
+      case Type::NO_WRITE:
+        break;
+      case Type::ONE_WRITE:
+        func(single_write_addr, single_write_size);
+        break;
+      case Type::MULTI_WRITE:
+        for(uint32_t i = 0; i < multi_mem_access_info->numberOfMemops; ++i) {
+          func(multi_mem_access_info->memop[i].memoryAddress,
+               multi_mem_access_info->memop[i].bytesAccessed);
+        }
+        break;
+    }
+  }
+
+ private:
+  enum class Type {
+    NO_WRITE,
+    ONE_WRITE,
+    MULTI_WRITE,
+  };
+
 
   const Type                             type;
   const ADDRINT                          single_write_addr     = 0;
@@ -150,7 +170,7 @@ struct ProcState {
 
   void update(CONTEXT* _ctxt, UINT64 _uid, bool _u_i, bool _wrongpath,
               bool _wrongpath_nop_mode, ADDRINT _wpnm_eip,
-              Mem_Writes_Info _mem_write_info, bool _is_syscall) {
+              Mem_Writes_Info _mem_writes_info, bool _is_syscall) {
     uid                      = _uid;
     unretireable_instruction = _u_i;
     wrongpath                = _wrongpath;
@@ -160,7 +180,7 @@ struct ProcState {
 
     PIN_SaveContext(_ctxt, &ctxt);
 
-    uint32_t _num_mem_state = _mem_write_info.get_num_mem_writes();
+    uint32_t _num_mem_state = _mem_writes_info.get_num_mem_writes();
 
     if(_num_mem_state > num_mem_state) {
       if(NULL != mem_state_list) {
@@ -172,31 +192,13 @@ struct ProcState {
 
     num_mem_state = _num_mem_state;
 
-    auto save_mem = [](MemState* mem_state, ADDRINT write_addr,
-                       uint32_t write_size) {
-      ADDRINT masked_write_addr = ADDR_MASK(write_addr);
-      mem_state->init(masked_write_addr, write_size);
-      PIN_SafeCopy(mem_state->mem_data_ptr, (void*)masked_write_addr,
-                   write_size);
-    };
-
-    switch(_mem_write_info.type) {
-      case Mem_Writes_Info::Type::NO_WRITE:
-        break;
-      case Mem_Writes_Info::Type::ONE_WRITE:
-        save_mem(&mem_state_list[0], _mem_write_info.single_write_addr,
-                 _mem_write_info.single_write_size);
-        break;
-      case Mem_Writes_Info::Type::MULTI_WRITE:
-        for(uint32_t i = 0;
-            i < _mem_write_info.multi_mem_access_info->numberOfMemops; ++i) {
-          save_mem(
-            &mem_state_list[i],
-            _mem_write_info.multi_mem_access_info->memop[i].memoryAddress,
-            _mem_write_info.multi_mem_access_info->memop[i].bytesAccessed);
-        }
-        break;
-    }
+    int i = 0;
+    _mem_writes_info.for_each_mem([&i, this](ADDRINT addr, uint32_t size) {
+      ADDRINT masked_addr = ADDR_MASK(addr);
+      mem_state_list[i].init(masked_addr, size);
+      PIN_SafeCopy(mem_state_list[i].mem_data_ptr, (void*)masked_addr, size);
+      ++i;
+    });
   }
 
   ~ProcState() {
@@ -343,11 +345,16 @@ class Pintool_State {
 
   uint64_t get_curr_inst_uid() { return uid_ctr; }
 
-  CONTEXT* get_context_for_changing_control_flow() {
-    return &next_pintool_state_;
-  }
+  CONTEXT* get_context_for_changing_control_flow() { return &next_ctxt_; }
 
   bool is_on_wrongpath() { return on_wrongpath_; }
+  bool is_on_wrongpath_nop_mode() {
+    return wrongpath_nop_mode_reason_ != WPNM_NOT_IN_WPNM;
+  }
+  Wrongpath_Nop_Mode_Reason get_wrongpath_nop_mode_reason() {
+    return wrongpath_nop_mode_reason_;
+  }
+  uint64_t get_next_rip() { return next_rip_; }
 
   // ***********************  Setters  **********************
   void clear_changing_control_flow() {
@@ -355,27 +362,39 @@ class Pintool_State {
     should_skip_next_instruction_ = false;
   }
 
-  void set_next_state_for_changing_control_flow(const CONTEXT* next_state,
+  void set_next_state_for_changing_control_flow(const CONTEXT* next_ctxt,
                                                 bool           redirect_rip,
                                                 uint64_t       next_rip,
                                                 bool skip_next_instruction) {
     should_change_control_flow_ = true;
-    PIN_SaveContext(next_state, &next_pintool_state_);
+    PIN_SaveContext(next_ctxt, &next_ctxt_);
     if(redirect_rip) {
-      PIN_SetContextReg(&next_pintool_state_, REG_INST_PTR, next_rip);
+      PIN_SetContextReg(&next_ctxt_, REG_INST_PTR, next_rip);
     }
     should_skip_next_instruction_ = skip_next_instruction;
   }
 
   void set_wrongpath(bool on_wrongpath) { on_wrongpath_ = on_wrongpath; }
+  void set_wrongpath_nop_mode(
+    Wrongpath_Nop_Mode_Reason wrongpath_nop_mode_reason, uint64_t next_rip) {
+    wrongpath_nop_mode_reason_ = wrongpath_nop_mode_reason;
+    if(!next_rip) {
+      next_rip_ = 1;
+    } else {
+      next_rip_ = ADDR_MASK(next_rip);
+    }
+  }
 
  private:
   bool    should_change_control_flow_;
   bool    should_skip_next_instruction_;
-  CONTEXT next_pintool_state_;
+  CONTEXT next_ctxt_;
 
-  uint64_t uid_ctr       = 0;
-  bool     on_wrongpath_ = false;
+  uint64_t uid_ctr = 0;
+
+  bool                      on_wrongpath_              = false;
+  Wrongpath_Nop_Mode_Reason wrongpath_nop_mode_reason_ = WPNM_NOT_IN_WPNM;
+  uint64_t                  next_rip_                  = 0;
 };
 
 
